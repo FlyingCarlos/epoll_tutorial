@@ -93,6 +93,7 @@ int main(int argc, char *argv[]) {
     struct epoll_event events[MAX_EVENTS];
     
     while (running) {
+        // "number of fds"（就绪文件描述符数量）
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000); // 1秒超时
         
         if (nfds == -1) {
@@ -108,17 +109,50 @@ int main(int argc, char *argv[]) {
             int fd = events[i].data.fd;
             uint32_t events_mask = events[i].events;
             
+            // 打印事件详情（调试用）
+            printf("Event on fd %d: ", fd);
+            if (events_mask & EPOLLIN) printf("EPOLLIN ");
+            if (events_mask & EPOLLOUT) printf("EPOLLOUT ");
+            if (events_mask & EPOLLRDHUP) printf("EPOLLRDHUP ");
+            if (events_mask & EPOLLPRI) printf("EPOLLPRI ");
+            if (events_mask & EPOLLERR) printf("EPOLLERR ");
+            if (events_mask & EPOLLHUP) printf("EPOLLHUP ");
+            // 注意：EPOLLET 是触发模式标志，不会出现在返回的事件中
+            printf("\n");
+            
             if (fd == listen_fd) {
-                // 新连接到达
-                handle_new_connection(listen_fd, epoll_fd);
+                // 监听套接字事件
+                if (events_mask & EPOLLIN) {
+                    // 新连接到达
+                    handle_new_connection(listen_fd, epoll_fd);
+                } else if (events_mask & EPOLLERR) {
+                    // 监听套接字错误
+                    printf("Error on listen socket fd %d\n", fd);
+                    perror("listen socket error");
+                    // 在实际应用中，可能需要重新创建监听套接字
+                } else if (events_mask & EPOLLHUP) {
+                    // 监听套接字挂起（极少见）
+                    printf("Listen socket fd %d hung up\n", fd);
+                }
             } else {
                 // 客户端连接事件
-                if (events_mask & (EPOLLHUP | EPOLLERR)) {
-                    // 连接错误或挂起
+                if (events_mask & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
+                    // 连接错误、挂起或对端关闭写操作
+                    printf("Connection error/close detected on fd %d\n", fd);
                     handle_client_disconnect(fd, epoll_fd);
                 } else if (events_mask & EPOLLIN) {
                     // 有数据可读
                     handle_client_message(fd, epoll_fd);
+                } else if (events_mask & EPOLLOUT) {
+                    // 可写事件（处理大量数据写入或从EAGAIN恢复）
+                    printf("Socket fd %d ready for writing (recovered from EAGAIN)\n", fd);
+                    // 在实际应用中，这里会：
+                    // 1. 从保存的缓冲区继续发送数据
+                    // 2. 发送完成后切换回EPOLLIN模式
+                    // 3. 释放发送缓冲区内存
+                } else if (events_mask & EPOLLPRI) {
+                    // 紧急数据
+                    printf("Priority data available on fd %d\n", fd);
                 }
             }
         }
@@ -210,7 +244,7 @@ void handle_new_connection(int listen_fd, int epoll_fd) {
         // 将新的客户端fd注册到epoll
         struct epoll_event event;
         event.data.fd = client_fd;
-        event.events = EPOLLIN | EPOLLET; // 边沿触发，监听可读事件
+        event.events = EPOLLIN | EPOLLRDHUP | EPOLLET; // 边沿触发，监听可读事件和对端关闭
         
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
             perror("epoll_ctl: client_fd");
@@ -249,7 +283,7 @@ void handle_client_message(int client_fd, int epoll_fd) {
             char response[BUFFER_SIZE];
             process_message(buffer, response, BUFFER_SIZE);
             
-            // 发送回复
+            // 发送回复到内核发送缓冲区
             ssize_t response_len = strlen(response);
             ssize_t bytes_sent = write(client_fd, response, response_len);
             
@@ -259,8 +293,18 @@ void handle_client_message(int client_fd, int epoll_fd) {
                     handle_client_disconnect(client_fd, epoll_fd);
                     return;
                 }
+                // EAGAIN: 本地发送缓冲区满，需要等待
+                // 在高性能服务器中，这里需要：
+                // 1. 保存未发送的数据
+                // 2. 注册 EPOLLOUT 事件
+                // 3. 等待套接字可写
             } else if (bytes_sent != response_len) {
+                // 部分数据进入发送缓冲区，剩余数据需要后续处理
+                // 在高性能服务器中，这里需要：
+                // 1. 保存剩余的 (response_len - bytes_sent) 字节
+                // 2. 注册 EPOLLOUT 事件继续发送
                 printf("Warning: partial write (%zd/%zd bytes)\n", bytes_sent, response_len);
+                // 注意：即使部分写入成功，也不代表客户端已收到任何数据
             }
             
         } else if (bytes_read == 0) {
